@@ -1,0 +1,13 @@
+{
+  "name": "claude-session-board",
+  "description": "session-board: a Claude Code side pane that groups one session's running, waiting, blocked, held and done work by topic",
+  "owner": {
+    "name": "Mike Akamine"
+  },
+  "plugins": [
+    {
+      "name": "session-board",
+      "source": "./"
+    }
+  ]
+}

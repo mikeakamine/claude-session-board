@@ -1,0 +1,10 @@
+{
+  "name": "session-board",
+  "version": "0.1.0",
+  "description": "Side pane: this session's running / waiting-on-you / blocked / held / done work by topic, derived from the local transcript (zero model tokens)",
+  "author": { "name": "Mike Akamine" },
+  "repository": "https://github.com/mikeakamine/claude-session-board",
+  "license": "MIT",
+  "keywords": ["session", "pane", "subagents", "status"],
+  "types": "./types/index.d.ts"
+}
