@@ -2,6 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Board, BoardItem, Detail } from '../types'
+import { DEFAULT_KEY, TOGGLE_ACTION, parseSetupArgs, planToggleBinding, previewDiff } from './keybinding'
 
 // The pane beside the chat: what this session has RUNNING, WAITING ON YOU, BLOCKED,
 // HELD and DONE, grouped by topic, plus YOU ASKED (your own prompts, newest first, collapsed).
@@ -138,6 +139,8 @@ async function refresh($: EngineInterface) {
         inferred: !!i.inferred,
         verdict: i.verdict,
         agent_id: i.agent_id,
+        model: i.model ?? null,
+        effort: i.effort ?? null,
         anchor: i.anchor ?? null,
         anchor_alt: i.anchor_alt ?? null,
       })),
@@ -156,9 +159,6 @@ async function refresh($: EngineInterface) {
 // (its own tool call or message; for a numbered ask, the latest reply naming its #N). The scroll
 // runs first, inside the press: the engine moves a transcript row only for the person's own input.
 // A row from before the last compaction is no longer in the view; the reason is shown in the detail.
-// The engine action the band's toggle claims. Unbound by default and handled by the engine only
-// inside the diff view, so outside it the person's chord for it reaches this Button.
-const TOGGLE_ACTION = 'app:toggleDiffNoiseFilter'
 
 async function toggleBoard($: EngineInterface) {
   const isUp = (await $.ui.panes()).some(p => p.id === PANE)
@@ -211,6 +211,73 @@ async function toggle($: EngineInterface, id: string) {
 }
 
 
+// `/board setup [<key>] [--apply]`: add the show/hide chord (default ctrl+q) to this machine's
+// ~/.claude/keybindings.json. Without --apply it only previews; with it, it writes -- atomically
+// (temp file, then mv), after saving the old file as keybindings.json.bak-board. It never touches any
+// other file, never overwrites a chord already bound to something else, and refuses malformed JSON.
+async function setupKeybinding($: EngineInterface, rest: string): Promise<string> {
+  const args = parseSetupArgs(rest)
+  if (args.kind === 'usage') return `${args.why}. Usage: /board setup [<key>] [--apply]`
+  const home = await $.env.get('HOME')
+  if (!home) return 'board setup: HOME is not set; nothing written'
+  const path = `${home}/.claude/keybindings.json`
+  const exists = await $.fs.exists(path)
+  let before: string | null = null
+  try {
+    if (exists) before = await $.fs.read(path)
+  } catch (err) {
+    return `board setup: cannot read ${path} (${String(err).slice(0, 120)}); nothing written`
+  }
+  const plan = planToggleBinding(before, args.key)
+  const notes = plan.notes.map(n => `note: ${n}`)
+  const lines: string[] = []
+  if (plan.status === 'invalid') return [`board setup: ${plan.reason}. Fix or remove ${path}, then run it again.`, ...notes].join('\n')
+  if (plan.status === 'unchanged') return [`board setup: nothing to do, ${plan.key} already toggles the board in ${path}.`, ...notes].join('\n')
+  if (plan.status === 'conflict') {
+    return [
+      `board setup: ${plan.key} is already bound in Global to ${JSON.stringify(plan.existing)} in ${path}; left alone.`,
+      `Pick another key: /board setup <key> (for example /board setup alt+b), or free ${plan.key} first.`,
+      ...notes,
+    ].join('\n')
+  }
+  const verb = plan.status === 'created' ? 'create' : 'update'
+  lines.push(`board setup: will ${verb} ${path} so ${plan.key} shows/hides the board (action ${TOGGLE_ACTION}). Change:`)
+  lines.push(previewDiff(plan.before, plan.after), ...notes)
+  if (!args.apply) {
+    lines.push(`Nothing written. Run /board setup${args.key === DEFAULT_KEY ? '' : ` ${args.key}`} --apply to write it` +
+      (plan.before === null ? '.' : ` (the old file is kept as ${path}.bak-board).`))
+
+    return lines.join('\n')
+  }
+  const hasBackup = plan.before !== null
+  const bak = `${path}.bak-board`
+  let keptOlder = false
+  try {
+    // a symbolic link (a dotfiles repo) is written through, not replaced by a plain file
+    const real = exists
+      ? (await $.fs.stat(path, { resolve: true }).catch(() => undefined))?.realPath ?? path
+      : path
+    // the first backup is the person's original; a later setup does not overwrite it
+    if (hasBackup) {
+      keptOlder = await $.fs.exists(bak)
+      if (!keptOlder) await $.fs.write(bak, plan.before as string)
+    }
+    const tmp = `${real}.board-tmp`
+    await $.fs.write(tmp, plan.after)
+    const mv = await $.process.run(['mv', '-f', tmp, real], { timeoutMs: 5000 })
+    if (mv.exitCode !== 0) return `board setup: could not move the new file into place (${mv.stderr.slice(0, 120)}); ${path} is unchanged`
+    const back = planToggleBinding(await $.fs.read(path), args.key)
+    if (back.status !== 'unchanged') {
+      return `board setup: wrote ${path} but the read-back check failed` + (hasBackup ? `; restore from ${bak}` : '; delete it to undo')
+    }
+  } catch (err) {
+    return `board setup: write failed (${String(err).slice(0, 160)}); ${path} is unchanged` + (hasBackup ? ` or restorable from ${bak}` : '')
+  }
+  lines.push(`Written${!hasBackup ? '' : keptOlder ? `; ${bak} already existed and was kept` : `; previous file saved as ${bak}`}. ${plan.key} takes effect when Claude Code reloads keybindings (it watches the file; restart if it does not).`)
+
+  return lines.join('\n')
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -218,14 +285,17 @@ export const register: Register = on => {
     await ensureLive($)
     await $.command.register({
       name: 'board',
-      description: 'Open the session board: running / waiting on you / held / done, by topic',
+      description: 'Open the session board (running / waiting on you / held / done, by topic); `setup` adds its show/hide key',
     })
     if (e.isInteractive) void $.ui.open({ id: PANE, title: 'Session board' })
 
     return started
   })
 
-  on('command.run', { command: 'board' }, async $ => {
+  on('command.run', { command: 'board' }, async ($, e) => {
+    const [sub, ...rest] = e.args.trim().split(/\s+/).filter(Boolean)
+    if (sub === 'setup') return { text: await setupKeybinding($, rest.join(' ')) }
+    if (sub) return { text: 'Usage: /board (open the pane) | /board setup [<key>] [--apply] (add the show/hide chord to keybindings.json)' }
     await ensureLive($)
     await refresh($)
     await $.ui.open({ id: PANE, title: 'Session board', focus: true })
@@ -361,7 +431,11 @@ export const register: Register = on => {
         const label = `${it.id.startsWith('#') && !it.title.startsWith(it.id) ? it.id + ' ' : ''}${it.title}${
           it.id.startsWith('#') && it.verdict ? ` → ${it.verdict}` : ''
         }`
-        const head = `▾ ${it.topic.padEnd(10).slice(0, 10)} ${when(it, now).padStart(6)} ${label}`
+        // a subagent's model/effort, dim after the title; unknown parts are left out
+        const tag = it.kind === 'agent' && (state === 'running' || state === 'done')
+          ? [it.model, it.effort].filter(Boolean).join('/')
+          : ''
+        const head = `▾ ${it.topic.padEnd(10).slice(0, 10)} ${when(it, now).padStart(6)} ${label}${tag ? ` · ${tag}` : ''}`
         add(
           <Button key={it.id} plain onPress={() => pressRow($, it)}>
             <Text
@@ -371,6 +445,7 @@ export const register: Register = on => {
               {openId === it.id ? '▾' : '▸'} {it.topic.padEnd(10).slice(0, 10)}{' '}
               {when(it, now).padStart(6)} {label}
               {it.inferred ? ' (inferred)' : ''}
+              {tag ? <Text color={FG_DIM}>{` · ${tag}`}</Text> : null}
             </Text>
           </Button>,
           true,

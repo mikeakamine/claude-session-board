@@ -51,19 +51,40 @@ Plugins, Add marketplace with `mikeakamine/claude-session-board`, then Add plugi
 
 Requires `python3` on your `PATH` (3.7 or later, standard library only).
 
+Then, once per machine, add the show/hide key (`ctrl+q`) to your Claude Code keybindings.
+Update the plugin if you already have it (`/plugin marketplace update claude-session-board`,
+then `/reload-plugins` or restart), and run:
+
+```
+/board setup --apply
+```
+
+Without `--apply`, `/board setup` only previews the change. See "Show/hide from the prompt"
+below for what it does and does not touch.
+
 ## Use
 
 - `/board` opens and focuses the pane. `ctrl+x tab` focuses it; the arrow keys scroll it
   when focused. Unfocused, a short pane shows what needs you first and ends with
   "+N more".
 - Press a row for its detail; press it again to close it.
+- **Model and effort on subagent rows.** A running or finished subagent shows its model and
+  effort after the title (`Agent a · sonnet/medium`), and in its detail. The model is what the
+  Agent call asked for, else the `model:` of the agent's definition (`~/.claude/agents/<type>.md`
+  or the project's `.claude/agents/<type>.md`, the project's winning), else `inherits` for the
+  general-purpose default or a definition that names none. A part that cannot be found is left
+  out, never guessed.
 - **Decisions you are asked.** When the assistant writes a line like
   `> **#12 — agree/disagree:** Publish the repo.` (blockquote and bold are optional;
   `#12 - agree/disagree:` and `#12 agree/disagree:` work too), it shows under WAITING ON
   YOU as `#12`, and a press scrolls the transcript to that message. A later definition of
   the same number replaces the earlier one. Answer in the prompt box with `12 agree`,
   `1 agree, 2 disagree`, `#12 ...`, `re #12 (...): ...`, or the words of the ask plus
-  `agree` ("release notes agree"); the row moves to DONE with your verdict. Plain numbered
+  `agree` ("release notes agree"). Ranges and lists work in either order: `agree 17-20`,
+  `17-20 agree` (a plain or en dash), `agree 17, 18 and 20`, `17-20 yes`, `yes 14`, `14 yes`
+  (yes and no count as agree and disagree). `agree on all` or `all agree` answers every
+  decision in the reply right before it, and only when your prompt follows that reply
+  directly. The row moves to DONE with your verdict. Plain numbered
   option lists are no longer read as asks unless the reply also says agree/disagree.
 - **YOU ASKED (N).** Your own prompts (not notifications), newest first, last 50, collapsed
   behind "show your questions (N)". Press one to jump back to it in the transcript and see
@@ -72,7 +93,20 @@ Requires `python3` on your `PATH` (3.7 or later, standard library only).
   `app:toggleDiffNoiseFilter`, which is unbound by default. Bind a chord to it in
   `~/.claude/keybindings.json` and that chord shows or hides the pane from the prompt.
   The toggle is `ctrl+q` (works in any terminal with no settings; the band's hint reads
-"ctrl+q show/hide"). Add it to `~/.claude/keybindings.json`:
+"ctrl+q show/hide"). `/board setup` adds it for you:
+
+  - `/board setup` shows the change to `~/.claude/keybindings.json` and writes nothing.
+  - `/board setup --apply` shows the same change and writes it. The merge keeps every other
+    binding and the file's `$schema` and `$docs` fields, writes through a temporary file and
+    a rename, and saves the previous file once as `keybindings.json.bak-board` (an existing
+    backup is kept). No change needed means nothing is written.
+  - If `ctrl+q` is already bound to something else in the Global context, it is left alone
+    and the command says so: pick another key with `/board setup alt+b --apply` (the band's
+    hint keeps saying `ctrl+q`).
+  - A `keybindings.json` that is not valid JSON, or has an unexpected shape, is refused and
+    not touched. No other file is ever read or written by the command.
+
+  The binding it adds is:
 
 ```json
 { "bindings": [ { "context": "Global", "bindings": { "ctrl+q": "app:toggleDiffNoiseFilter" } } ] }
@@ -158,7 +192,9 @@ with none running, the newest one the session referenced.
 ## Privacy
 
 The board reads local files only: the session's transcript, the ledger, background task
-output files and, if configured, sprint folders. It makes no network calls and spends
+output files, agent definition files (`~/.claude/agents` and the project's `.claude/agents`,
+read-only) and, if configured, sprint folders. The only file it ever writes outside its own
+ledger is `~/.claude/keybindings.json`, and only for `/board setup --apply`. It makes no network calls and spends
 zero model tokens; the pane refreshes every 20 seconds by running the Python script. The
 ledger holds the text you or the assistant write to it and stays on your machine.
 

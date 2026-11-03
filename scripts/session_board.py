@@ -283,6 +283,8 @@ def parse_transcript(path, now=None, sprint_re=None):
     refs = {}               # "l:x" / "m:app:id" / "#4" -> (uuid, alt) of the latest message naming it
     replies = {}            # item id -> epoch of the user's latest "re <id> ..." reply (the pane's reply button)
     last_ts = None
+    reply_ts = []           # epochs of the assistant's text replies (adjacency for "agree on all")
+    _CTX.update(cwd=None, defs={})
     with open(path) as f:
         for line in f:
             try:
@@ -291,6 +293,8 @@ def parse_transcript(path, now=None, sprint_re=None):
                 continue
             if rec.get("isSidechain"):
                 continue
+            if isinstance(rec.get("cwd"), str):
+                _CTX["cwd"] = rec["cwd"]
             ts = _iso_to_epoch(rec.get("timestamp"))
             if ts is not None:
                 last_ts = ts
@@ -333,6 +337,8 @@ def parse_transcript(path, now=None, sprint_re=None):
                                 sprints.append(m.group(1))
                     elif b.get("type") == "text":
                         _scan_asks(b.get("text") or "", ts, inferred, rec.get("uuid"), msg.get("id"))
+                        if (b.get("text") or "").strip() and ts is not None:
+                            reply_ts.append(ts)
                         if pending and (b.get("text") or "").strip():
                             line = next(l for l in b["text"].splitlines() if l.strip())
                             for a in pending:
@@ -367,7 +373,7 @@ def parse_transcript(path, now=None, sprint_re=None):
             c["state"] = "done"
             c["note"] = "fire time passed (assumed fired)"
             c["ended"] = c["next_fire"]
-    _answer_decisions(inferred, prompts)
+    _answer_decisions(inferred, prompts, reply_ts)
     # inferred asks answered by a later prompt naming the number
     for n, it in inferred.items():
         if it.get("decision"):
@@ -423,6 +429,81 @@ def anchor_for(marks, epoch):
     return best
 
 
+# Agent definitions are read-only and cached per refresh (parse_transcript resets the cache). Only the
+# user's ~/.claude/agents and the project's .claude/agents (the transcript's cwd and its parents) are
+# consulted; the project's definition wins, as it does in Claude Code.
+USER_AGENTS_DIR = os.path.expanduser("~/.claude/agents")
+_CTX = {"cwd": None, "defs": {}}
+_AGENT_TYPE_RE = re.compile(r"^[A-Za-z0-9][\w.-]*$")
+
+
+def _agent_def(subagent_type):
+    """{"model": ..., "effort": ...} from `<type>.md` frontmatter, {} when the definition has neither,
+    None when no definition file exists (built-in types, plugin agents: unknown, never guessed)."""
+    if not subagent_type or not _AGENT_TYPE_RE.match(subagent_type):
+        return None
+    defs = _CTX["defs"]
+    key = (_CTX.get("cwd"), subagent_type)
+    if key in defs:
+        return defs[key]
+    dirs, cwd = [], _CTX.get("cwd")
+    while cwd and os.path.isabs(cwd):
+        dirs.append(os.path.join(cwd, ".claude", "agents"))
+        parent = os.path.dirname(cwd)
+        if parent == cwd:
+            break
+        cwd = parent
+    dirs.append(USER_AGENTS_DIR)
+    out = None
+    for d in dirs:
+        fp = os.path.join(d, subagent_type + ".md")
+        if not os.path.isfile(fp):
+            continue
+        out = {}
+        try:
+            with open(fp) as f:
+                raw = f.read(65537)
+            head = raw.splitlines()
+        except OSError:
+            break
+        if head and head[0].strip() == "---":
+            closed = False
+            for line in head[1:]:
+                if line.strip() == "---":
+                    closed = True
+                    break
+                m = re.match(r"^(model|effort)\s*:\s*(.*?)\s*$", line)
+                if m:
+                    val = m.group(2).split(" #", 1)[0].strip().strip("'\"")
+                    if val:
+                        out[m.group(1)] = val
+            if not closed and len(raw) > 65536:
+                out = None          # frontmatter runs past what is read: unknown, not "inherits"
+        break
+    defs[key] = out
+    return out
+
+
+def _agent_model(inp, tur):
+    """model / effort / where they came from, for an Agent call: the call's own `model` first, else the
+    subagent_type's definition frontmatter, else "inherits" (the session's model) for the general-purpose
+    default or a definition that names none. Anything else stays unknown (None), never guessed."""
+    stype = inp.get("subagent_type")
+    d = _agent_def(stype)
+    model = inp.get("model") or None
+    effort = inp.get("effort") or None
+    src = "call" if model else None
+    if d:
+        if not model and d.get("model") and d["model"].lower() != "inherit":
+            model, src = d["model"], "definition"
+        if not effort and d.get("effort"):
+            effort = d["effort"]
+    if not model and (d is not None or not stype or stype == "general-purpose"):
+        model, src = "inherits", "inherits"
+    return {"model": model, "effort": effort, "model_source": src,
+            "resolved_model": (tur or {}).get("resolvedModel")}
+
+
 def _on_tool_use(b, ts, uses, crons, asks_q, agents, bashes):
     name, inp, uid = b.get("name"), b.get("input") or {}, b.get("id")
     uses[uid] = (name, inp, ts)
@@ -466,7 +547,7 @@ def _on_tool_result(b, tur, ts, uses, agents, bashes, crons, asks_q):
             "state": "running" if is_async else "done",
             "title": _clip(inp.get("description") or tur.get("description") or "agent"),
             "started": started, "ended": None if is_async else ts,
-            "model": inp.get("model") or tur.get("resolvedModel"),
+            **_agent_model(inp, tur),
             "subagent_type": inp.get("subagent_type"),
             "output": tur.get("outputFile"),
             "sprint_key": f"{brief.group(1)}:{brief.group(2)}" if brief else None,
@@ -561,6 +642,33 @@ def _verdict(word):
     return "disagree" if w in ("disagree", "disagreed", "no") else "agree" if w else None
 
 
+_NUM = r"#?\d{1,3}"
+_NUMS = (rf"{_NUM}(?:\s*[-\u2013\u2014]\s*{_NUM})?"
+         rf"(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+|\s*&\s*){_NUM}(?:\s*[-\u2013\u2014]\s*{_NUM})?)*")
+# "agree 17-20", "yes 14", "agree 17, 18 and 20" (a bare number list must end the clause)
+LIST_VERB_RE = re.compile(rf"^\s*(?:re\s+)?({VERDICT_WORD})\s+(?:on\s+|to\s+)?({_NUMS})"
+                          r"(?=\s*(?:$|[,.;:!?)]|\s(?:and|but|also|please|thanks|then)\b))", re.I)
+# "17-20 agree", "17\u201320 yes", "17, 18 and 20 agree"
+LIST_NUM_RE = re.compile(rf"^\s*({_NUMS})\s*[:.\-\u2013\u2014)]?\s*({VERDICT_WORD})\b", re.I)
+ALL_RE = re.compile(rf"^\s*(?:({VERDICT_WORD})\s+(?:on\s+|to\s+|with\s+)?(?:all|everything)"
+                    rf"|(?:all|everything)\s+({VERDICT_WORD}))\s*[.!]*\s*$", re.I)
+ALL_KEY = "*all*"
+
+
+def _numbers(spec):
+    """Numbers in "17-20", "17, 18 and 20", "#3": ranges expand (at most 60 wide), junk is dropped."""
+    out = []
+    for part in re.split(r"\s*,\s*(?:and\s+)?|\s+and\s+|\s*&\s*", spec.strip()):
+        m = re.match(rf"^#?(\d{{1,3}})(?:\s*[-\u2013\u2014]\s*#?(\d{{1,3}}))?$", part.strip())
+        if not m:
+            continue
+        a = int(m.group(1))
+        b = int(m.group(2)) if m.group(2) else a
+        if a <= b <= a + 60:
+            out.extend(str(n) for n in range(a, b + 1))
+    return out
+
+
 def _prompt_verdicts(text, open_decisions):
     """{number: verdict-or-None} that one prompt of yours answers. Forms: "7 agree", "#7 ...",
     "agree on #7", "re #7 (title): agree", comma/newline lists, and "<words from a decision> agree"."""
@@ -578,6 +686,21 @@ def _prompt_verdicts(text, open_decisions):
     m = BARE_DECISION_RE.match(text)
     if m:
         out[m.group(1)] = _verdict(m.group(2))
+    m = ALL_RE.match(text[:80])
+    if m:
+        out[ALL_KEY] = _verdict(m.group(1) or m.group(2))
+        return out
+    for line in re.split(r"[;\n]", text[:600]):
+        m = LIST_VERB_RE.match(line)
+        w = m.group(1) if m else None
+        if not m:
+            m = LIST_NUM_RE.match(line)
+            w = m.group(2) if m else None
+        if m:
+            spec = m.group(2) if m.re is LIST_VERB_RE else m.group(1)
+            for n in _numbers(spec):
+                if n in open_decisions:
+                    out[n] = _verdict(w)
     for seg in re.split(r"[,;\n]", text[:600]):
         m = SEG_NUM_RE.match(seg)
         if m:
@@ -602,7 +725,7 @@ def _prompt_verdicts(text, open_decisions):
     return out
 
 
-def _answer_decisions(inferred, prompts):
+def _answer_decisions(inferred, prompts, reply_ts=()):
     """A later prompt of yours that names a decision's number resolves it (verdict stored)."""
     dec = {n: it for n, it in inferred.items() if it.get("decision")}
     for pts, text in prompts:
@@ -610,7 +733,14 @@ def _answer_decisions(inferred, prompts):
                  if it["state"] == "waiting" and pts and it["started"] and pts > it["started"]}
         if not open_:
             continue
-        for n, verdict in _prompt_verdicts(text or "", open_).items():
+        verdicts = _prompt_verdicts(text or "", open_)
+        if ALL_KEY in verdicts:
+            # "agree on all" answers the asks of the reply it immediately follows (no assistant text
+            # in between), and only when that reply listed open #N asks
+            last = max([t for t in reply_ts if t < pts] or [0])
+            listed = {n: it for n, it in open_.items() if it["started"] == last}
+            verdicts = {n: verdicts[ALL_KEY] for n in listed}
+        for n, verdict in verdicts.items():
             it = open_.get(n)
             if it:
                 it.update(state="done", ended=pts, verdict=verdict or "answered",
@@ -999,7 +1129,8 @@ def detail(board, item_id, lines=30):
         meta.append(f"ended {_local_hm(it['ended'])}")
     if it.get("last_activity"):
         meta.append(f"last activity {_age(it['last_activity'], now)} ago")
-    for k in ("model", "subagent_type", "agent", "schedule", "verdict", "note", "source"):
+    for k in ("model", "effort", "model_source", "resolved_model", "subagent_type", "agent", "schedule",
+              "verdict", "note", "source"):
         if it.get(k):
             meta.append(f"{k} {it[k]}")
     if it.get("next_fire"):
@@ -1069,6 +1200,8 @@ def render_text(board, width=100):
                 when = _local_hm(it["ended"])
             extra = it.get("ask") and state == "waiting" and "" or ""
             tag = " (inferred)" if it.get("inferred") else ""
+            if it.get("kind") == "agent" and (it.get("model") or it.get("effort")):
+                tag += " · " + "/".join(x for x in (it.get("model"), it.get("effort")) if x)
             line = f"  {it['id']:<14} {it['topic'][:10]:<10} {when:>8}  {it['title']}{tag}{extra}"
             out.append(_clip(line, width))
         if len(rows) > len(shown):

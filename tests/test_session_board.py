@@ -54,7 +54,10 @@ class BoardTest(unittest.TestCase):
         self.sprints = os.path.join(root, "proj", "sprints")
         self.sprint = os.path.join(self.sprints, "2026-10-31-test")
         os.makedirs(os.path.join(self.sprint, "briefs"))
-        self._saved = (sb.PROJECTS, sb.BOARD_DIR, sb.NAMES_DIR, sb.SPRINTS_DIR)
+        self._saved = (sb.PROJECTS, sb.BOARD_DIR, sb.NAMES_DIR, sb.SPRINTS_DIR, sb.USER_AGENTS_DIR)
+        self.user_agents = os.path.join(root, "home-agents")
+        os.makedirs(self.user_agents)
+        sb.USER_AGENTS_DIR = self.user_agents
         sb.PROJECTS = os.path.join(root, "projects")
         sb.BOARD_DIR = os.path.join(root, "board")
         sb.NAMES_DIR = os.path.join(root, "names")
@@ -65,7 +68,7 @@ class BoardTest(unittest.TestCase):
         self._write_transcript()
 
     def tearDown(self):
-        sb.PROJECTS, sb.BOARD_DIR, sb.NAMES_DIR, sb.SPRINTS_DIR = self._saved
+        sb.PROJECTS, sb.BOARD_DIR, sb.NAMES_DIR, sb.SPRINTS_DIR, sb.USER_AGENTS_DIR = self._saved
         self.tmp.cleanup()
 
     def _write_sprint(self):
@@ -202,6 +205,141 @@ class BoardTest(unittest.TestCase):
         self.assertEqual(items["#7"]["anchor"], "y")      # the replacing message
         self.assertEqual(items["#8"]["anchor"], "x")
         self.assertNotIn("a plain list", " ".join(i["title"] for i in items.values()))
+
+    def _agent(self, n, off, cwd=None, result_extra=None, **inp):
+        """An async Agent call + its result, returned as rows (cwd stamped on the call's record)."""
+        call = asst(off, use(f"tu_m{n}", "Agent", description=f"model probe {n}", run_in_background=True,
+                             prompt="x", **inp))
+        if cwd:
+            call["cwd"] = cwd
+        return [call, result(off + 1, f"tu_m{n}", {"agentId": f"a{n:02d}xxxxxxxxx", "isAsync": True,
+                                                    **(result_extra or {})})]
+
+    def _def(self, root, name, body):
+        os.makedirs(root, exist_ok=True)
+        put(os.path.join(root, name + ".md"), body)
+
+    def test_agent_model_and_effort_sources(self):
+        proj = os.path.join(self.tmp.name, "proj")
+        self._def(self.user_agents, "builder", '---\nname: builder\nmodel: "sonnet"\neffort: medium  # cheap\n---\nbody\n')
+        self._def(self.user_agents, "plain", "---\nname: plain\neffort: high\n---\n")
+        self._def(self.user_agents, "inheriting", "---\nname: inheriting\nmodel: inherit\n---\n")
+        self._def(self.user_agents, "shadowed", "---\nmodel: opus\n---\n")
+        self._def(self.user_agents, "longdesc", "---\ndescription: " + "x" * 9000 + "\nmodel: haiku\neffort: low\n---\n")
+        self._def(self.user_agents, "huge", "---\ndescription: " + "x" * 70000 + "\nmodel: haiku\n---\n")
+        self._def(os.path.join(proj, ".claude", "agents"), "shadowed", "---\nmodel: haiku\neffort: low\n---\n")
+        self._append(
+            *self._agent(1, 300, model="opus", subagent_type="builder"),                 # the call wins
+            *self._agent(2, 310, subagent_type="builder"),                              # definition
+            *self._agent(3, 320, subagent_type="plain"),                                # effort only: inherits
+            *self._agent(4, 330, subagent_type="inheriting"),
+            *self._agent(6, 340, subagent_type="shadowed"),                             # no project: user def
+            *self._agent(5, 350, cwd=os.path.join(proj, "sub"), subagent_type="shadowed"),  # project wins
+            *self._agent(11, 395, subagent_type="longdesc"),                            # model past 4 KB
+            *self._agent(12, 396, subagent_type="huge"),                               # unreadable: unknown
+            *self._agent(7, 360),                                                       # no type: inherits
+            *self._agent(8, 370, subagent_type="Explore"),                              # unknown: omitted
+            *self._agent(9, 380, subagent_type="../etc/passwd"),                        # never a path
+            *self._agent(10, 390, subagent_type="builder", result_extra={"resolvedModel": "claude-sonnet-5-5"}),
+        )
+        os.makedirs(os.path.join(proj, "sub"))
+        items = self.by_id(self.board())
+        got = lambda n: {k: items[f"a:a{n:02d}xxxx"].get(k) for k in ("model", "effort", "model_source")}
+        self.assertEqual(got(1), {"model": "opus", "effort": "medium", "model_source": "call"})
+        self.assertEqual(got(2), {"model": "sonnet", "effort": "medium", "model_source": "definition"})
+        self.assertEqual(got(3), {"model": "inherits", "effort": "high", "model_source": "inherits"})
+        self.assertEqual(got(4), {"model": "inherits", "effort": None, "model_source": "inherits"})
+        self.assertEqual(got(5), {"model": "haiku", "effort": "low", "model_source": "definition"})
+        self.assertEqual(got(6), {"model": "opus", "effort": None, "model_source": "definition"})
+        self.assertEqual(got(7), {"model": "inherits", "effort": None, "model_source": "inherits"})
+        self.assertEqual(got(11), {"model": "haiku", "effort": "low", "model_source": "definition"})
+        self.assertEqual(got(12), {"model": None, "effort": None, "model_source": None})
+        self.assertEqual(got(8), {"model": None, "effort": None, "model_source": None})
+        self.assertEqual(got(9), {"model": None, "effort": None, "model_source": None})
+        self.assertEqual(items["a:a10xxxx"]["resolved_model"], "claude-sonnet-5-5")
+        text = sb.render_text(self.board())
+        self.assertIn("· sonnet/medium", text)
+        d = sb.detail(self.board(), "a:a02xxxx")
+        self.assertIn("model sonnet", d["lines"][1])
+        self.assertIn("effort medium", d["lines"][1])
+
+    def _decisions(self, extra=()):
+        self._append(
+            asst(200, {"type": "text", "text": "Decisions:\n#14 agree/disagree: Fourteen.\n"
+                       "#15 agree/disagree: Fifteen.\n#16 agree/disagree: Sixteen.\n"
+                       "#17 agree/disagree: Seventeen.\n#18 agree/disagree: Eighteen.\n"
+                       "#19 agree/disagree: Nineteen.\n#20 agree/disagree: Twenty.\n"
+                       "#21 agree/disagree: Twenty-one.\n"}),
+            *extra)
+        return self.by_id(self.board())
+
+    def _states(self, items, nums):
+        return {n: (items[f"#{n}"]["state"], items[f"#{n}"].get("verdict")) for n in nums}
+
+    def test_answer_ranges_and_lists_in_either_order(self):
+        for text, want in [
+            ("agree 17-20", {17: "agree", 18: "agree", 19: "agree", 20: "agree", 21: None}),
+            ("17-20 agree", {17: "agree", 20: "agree", 21: None}),
+            ("17\u201320 agree", {17: "agree", 20: "agree", 21: None}),     # en dash
+            ("agree 17, 18 and 20", {17: "agree", 18: "agree", 19: None, 20: "agree"}),
+            ("17, 18 and 20 agree", {17: "agree", 18: "agree", 19: None, 20: "agree"}),
+            ("17-20 yes", {17: "agree", 20: "agree", 21: None}),
+            ("yes 14", {14: "agree", 15: None}),
+            ("14 yes", {14: "agree", 15: None}),
+            ("disagree 15-16", {14: None, 15: "disagree", 16: "disagree", 17: None}),
+            ("no 16", {16: "disagree", 17: None}),
+        ]:
+            with self.subTest(text=text):
+                self.setUp()
+                try:
+                    items = self._decisions([prompt(300, text)])
+                    for n, verdict in want.items():
+                        st = items[f"#{n}"]
+                        if verdict is None:
+                            self.assertEqual(st["state"], "waiting", (text, n))
+                        else:
+                            self.assertEqual((st["state"], st["verdict"]), ("done", verdict), (text, n))
+                finally:
+                    self.tearDown()
+
+    def test_range_does_not_answer_numbers_that_are_not_open_asks(self):
+        items = self._decisions([prompt(300, "agree 1-30"), prompt(310, "yes 14 minutes later")])
+        self.assertEqual(items["#14"]["verdict"], "agree")        # open, inside 1-30
+        self.assertNotIn("#25", items)                             # nothing invented for the rest
+
+    def test_agree_on_all_resolves_the_listed_asks_only_right_after_the_reply(self):
+        for text in ("agree on all", "all agree", "agree all", "yes to all", "Agree on all."):
+            with self.subTest(text=text):
+                self.setUp()
+                try:
+                    items = self._decisions([prompt(300, text)])
+                    self.assertEqual({items[f"#{n}"]["state"] for n in range(14, 22)},
+                                     {"done"})
+                    self.assertEqual(items["#17"]["verdict"], "agree")
+                finally:
+                    self.tearDown()
+        # not "immediately after": an assistant reply sits between the listing and the prompt
+        self.setUp()
+        items = self._decisions([asst(250, {"type": "text", "text": "Anything else? Standing by."}),
+                                 prompt(300, "agree on all")])
+        self.assertEqual(items["#17"]["state"], "waiting")
+        self.tearDown()
+        # and not the asks of an older listing: only the latest listing reply's asks are resolved
+        self.setUp()
+        try:
+            items = self._decisions([asst(400, {"type": "text", "text": "More:\n#30 agree/disagree: Thirty.\n"}),
+                                     prompt(410, "all agree")])
+            self.assertEqual(items["#30"]["verdict"], "agree")
+            self.assertEqual(items["#17"]["state"], "waiting")
+        finally:
+            self.tearDown()
+        # with no listed asks open, "all agree" answers nothing
+        self.setUp()
+        try:
+            self._append(prompt(300, "all agree"))
+            self.assertEqual([i for i in self.board()["items"] if i.get("decision")], [])
+        finally:
+            self.tearDown()
 
     def test_decision_edge_cases(self):
         self._append(

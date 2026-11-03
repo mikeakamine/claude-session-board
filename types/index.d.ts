@@ -11,6 +11,10 @@ export type BoardItem = {
   /** A decision once answered: agree | disagree | answered. */
   verdict?: string | null
   agent_id?: string
+  /** Agent rows: the model, as the call named it, else the agent definition, else "inherits"; absent when unknown. */
+  model?: string | null
+  /** Agent rows: the effort from the agent definition (or the call); absent when unknown. */
+  effort?: string | null
   /** Where a press scrolls the transcript: a tool_use_id or a message uuid. */
   anchor?: string | null
   /** The same message's other id (API message id), tried when `anchor` is refused. */

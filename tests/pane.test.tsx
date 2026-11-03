@@ -261,3 +261,26 @@ test('an expanded YOU ASKED shows its newest rows only in an unfocused pane', as
   expect(await ui.find({ type: 'Button', text: /Offsite agenda prep/ })).toBeTruthy()
   await ui.unmount()
 })
+
+test('agent rows show model/effort after the title; unknown parts are left out', async ($, on) => {
+  const boardJson = { ...BOARD, counts: { running: 2, waiting: 0, blocked: 0, held: 0, done: 0 },
+    items: [
+      { id: 'a:aaa', kind: 'agent', state: 'running', topic: 'build', title: 'Agent a', model: 'sonnet', effort: 'medium', started: 1793479000 },
+      { id: 'a:bbb', kind: 'agent', state: 'running', topic: 'build', title: 'Agent b', model: 'inherits', started: 1793479000 },
+      { id: 'b:ccc', kind: 'bash', state: 'running', topic: 'build', title: 'Bash c', model: 'x', started: 1793479000 },
+    ] }
+  on('command.register', () => ({ value: { command: 'board' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 'sid-1' }))
+  on('clock.every', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('process.run', () => ({ value: { exitCode: 0, stdout: JSON.stringify(boardJson), stderr: '',
+    isStdoutTruncated: false, isStderrTruncated: false } }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Button', text: /Agent a · sonnet\/medium/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Button', text: /Agent b · inherits$/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Button', text: /Bash c · / })).toBeFalsy()
+  await ui.unmount()
+})
