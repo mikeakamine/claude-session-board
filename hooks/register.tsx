@@ -238,7 +238,7 @@ export const register: Register = on => {
   })
 
   // A one-line band above the prompt: the board's counts, and the show/hide toggle. Its Button
-  // claims the engine action TOGGLE_ACTION, so the person's chord for it (ctrl+x s or opt+s in
+  // claims the engine action TOGGLE_ACTION, so the person's chord for it (ctrl+x s or ctrl+q in
   // ~/.claude/keybindings.json) presses it from the prompt while the band is mounted.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
@@ -249,7 +249,7 @@ export const register: Register = on => {
       <Button key="toggle-board" plain action={TOGGLE_ACTION} onPress={() => toggleBoard($)}>
         <Text color={FG_DIM}>
           board: {c.running ?? 0} running · {c.waiting ?? 0} waiting on you
-          {e.surface === 'terminal' ? ' · opt+s show/hide' : ' · show/hide'}
+          {e.surface === 'terminal' ? ' · ctrl+q show/hide' : ' · show/hide'}
         </Text>
       </Button>
     )

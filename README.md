@@ -71,17 +71,12 @@ Requires `python3` on your `PATH` (3.7 or later, standard library only).
 - **Show/hide from the prompt (optional).** The band's toggle claims the engine action
   `app:toggleDiffNoiseFilter`, which is unbound by default. Bind a chord to it in
   `~/.claude/keybindings.json` and that chord shows or hides the pane from the prompt.
-  Two chords work side by side, `ctrl+x s` and `meta+s` (Option+S on a Mac; the band's
-  hint reads "opt+s show/hide"):
+  The toggle is `ctrl+q` (works in any terminal with no settings; the band's hint reads
+"ctrl+q show/hide"). Add it to `~/.claude/keybindings.json`:
 
-  ```json
-  {
-    "bindings": [
-      { "context": "Global", "bindings": { "ctrl+x s": "app:toggleDiffNoiseFilter",
-                                            "meta+s": "app:toggleDiffNoiseFilter" } }
-    ]
-  }
-  ```
+```json
+{ "bindings": [ { "context": "Global", "bindings": { "ctrl+q": "app:toggleDiffNoiseFilter" } } ] }
+```
 
   Inside the diff view the engine keeps that action for itself.
 
