@@ -109,7 +109,7 @@ class BoardTest(unittest.TestCase):
                                  "nextFireAt": int((T0 + 3600) * 1000)}),
             asst(55, use("tu_c2", "CronCreate", cron="0 9 * * *", recurring=False, prompt="Old reminder")),
             result(56, "tu_c2", {"id": "cron2", "recurring": False, "nextFireAt": int((T0 + 100) * 1000)}),
-            asst(60, {"type": "text", "text": "Three decisions need you:\n"
+            asst(60, {"type": "text", "text": "Three decisions need you (agree or disagree each):\n"
                       "1. **Venue, Friday:** booking is a purchase.\n"
                       "2. **Rollout:** I will not send the announcement.\n"
                       "3. **Offsite agenda:** the final call is yours."}),
@@ -156,6 +156,154 @@ class BoardTest(unittest.TestCase):
         self.assertEqual(items["#2"]["state"], "waiting")
         self.assertTrue(items["#2"]["inferred"])
         self.assertEqual(items["q:" + "tu_q"[-6:]]["state"], "waiting")
+
+    def _append(self, *rows):
+        with open(os.path.join(self.projects, SID + ".jsonl"), "a") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
+    def test_option_lists_are_not_asks(self):
+        self._append(asst(200, {"type": "text", "text": "Which way? Your call:\n"
+                                "1. **Skip the password:** one-time unlock.\n"
+                                "2. **Reset it:** I redeploy."}))
+        items = self.by_id(self.board())
+        # the new list has no agree/disagree marker: #1/#2 stay the old reply's asks
+        self.assertNotIn("Skip the password", items["#1"]["title"])
+        self.assertNotIn("Reset it", items["#2"]["title"])
+
+    def test_explicit_decision_forms_and_answers(self):
+        self._append(
+            dict(asst(200, {"type": "text", "text": "Two asks.\n\n"
+                       "> **#7 — agree/disagree:** Push the repo. If you disagree, we keep it local.\n"
+                       "**#8 - agree/disagree**: Send the **PDF** to Sam.\n"
+                       "#9 agree/disagree: Use `option 1` first.\n"
+                       "#10 — Agree or disagree: Rename the board.\n"
+                       "#11 agree/disagree: Name guard on the release notes page.\n"
+                       "1. **Pick one:** a plain list in the same reply is not inferred.\n"}), uuid="x"),
+            dict(asst(210, {"type": "text", "text": "Reminder:\n> **#7 — agree/disagree:** Push the repo to GitHub. Default is to wait."}), uuid="y"),
+            prompt(300, "7 agree, 8 disagree\nrandom words"),
+            prompt(310, "re #9 (Use option 1 first): agree\nthanks"),
+            prompt(320, "#10 sure, rename it"),
+            prompt(330, "release notes agree"),
+        )
+        items = self.by_id(self.board())
+        self.assertEqual(items["#7"]["title"], "Push the repo to GitHub.")   # later definition replaces
+        self.assertEqual(items["#7"]["state"], "done")
+        self.assertEqual(items["#7"]["verdict"], "agree")
+        self.assertRegex(items["#7"]["note"], r"^answered \d\d:\d\d: agree$")
+        self.assertEqual(items["#8"]["verdict"], "disagree")
+        self.assertEqual(items["#8"]["title"], "Send the PDF to Sam.")
+        self.assertEqual(items["#9"]["title"], "Use option 1 first.")
+        self.assertEqual(items["#9"]["verdict"], "agree")
+        self.assertEqual(items["#10"]["state"], "done")
+        self.assertEqual(items["#10"]["verdict"], "answered")
+        self.assertEqual(items["#11"]["state"], "done")                    # matched by words
+        self.assertNotIn("inferred", items["#7"])
+        self.assertEqual(items["#7"]["anchor"], "y")      # the replacing message
+        self.assertEqual(items["#8"]["anchor"], "x")
+        self.assertNotIn("a plain list", " ".join(i["title"] for i in items.values()))
+
+    def test_decision_edge_cases(self):
+        self._append(
+            asst(200, {"type": "text", "text": "**#7** — agree/disagree: Bold number form.\n"
+                       "#8 agree/disagree: Rename the Release Notes page.\n"
+                       "#9 agree/disagree: Other thing that mentions also.\n"
+                       "#10 agree/disagree: Third.\n"}),
+            prompt(300, "re #7 (Bold number form): go with the second one"),
+            prompt(310, "I also agree"),
+            prompt(320, '<pasted_content id="1">\nlog\n</pasted_content>\nwhat does this mean?'),
+            prompt(330, "1 agree, 2 agree, release notes agree"),
+            asst(400, {"type": "text", "text": "> **#10 — agree:** done, pushed."}))
+        b = self.board()
+        items = self.by_id(b)
+        self.assertEqual(items["#7"]["state"], "done")                      # a typed reply answers it
+        self.assertEqual(items["#7"]["verdict"], "answered")
+        self.assertEqual(items["#8"]["state"], "done")                      # "release notes agree"
+        self.assertEqual(items["#9"]["state"], "waiting")                   # "I also agree" names nothing
+        self.assertEqual(items["#10"]["title"], "Third.")                   # a bare "agree:" is not a decision
+        self.assertIn("what does this mean?", [i["title"] for i in b["items"] if i["state"] == "asked"])
+
+    def test_pending_items_optional_source(self):
+        src = os.path.join(self.tmp.name, "pending.json")
+        put(src, json.dumps([
+            {"id": "abcdef1234567", "kind": "handoff", "producer": "codex", "received_at": "2026-11-02T20:00:00Z",
+             "review": "tool show abcdef12"},
+            {"id": "99887766aaaa", "kind": "note", "producer": "othertool", "flags": ["shell-cmd"]},
+            {"kind": "no-id"}]))
+        self.assertNotIn("b:abcdef12", self.by_id(self.board()))           # off by default
+        os.environ["SESSION_BOARD_PENDING"] = src
+        try:
+            b = self.board()
+            items = self.by_id(b)
+            self.assertEqual(items["b:abcdef12"]["state"], "waiting")
+            self.assertEqual(items["b:abcdef12"]["title"], "handoff from codex waiting for review")
+            self.assertEqual(items["b:99887766"]["state"], "blocked")      # flagged
+            d = sb.detail(b, "b:99887766")
+            self.assertIn("shell-cmd", " ".join(d["lines"]))
+            self.assertIn("review: tool show abcdef12", " ".join(sb.detail(b, "b:abcdef12")["lines"]))
+            os.environ["SESSION_BOARD_PENDING"] = "echo '[{\"id\": \"cccccccc1\", \"kind\": \"x\"}]'"
+            self.assertIn("b:cccccccc", self.by_id(self.board()))          # a command works too
+            os.environ["SESSION_BOARD_PENDING"] = "exit 3"
+            self.assertNotIn("b:cccccccc", self.by_id(self.board()))       # a failing source shows nothing
+        finally:
+            os.environ.pop("SESSION_BOARD_PENDING", None)
+
+    def test_reused_decision_number_reopens_and_unanswered_waits(self):
+        self._append(asst(200, {"type": "text", "text": "> **#7 — agree/disagree:** First."}),
+                     prompt(300, "7 agree"),
+                     asst(400, {"type": "text", "text": "> **#7 — agree/disagree:** Second, a new question."}),
+                     asst(410, {"type": "text", "text": "> **#8 — agree/disagree:** Never answered."}),
+                     prompt(420, "no idea what 8 is, so no answer"))
+        items = self.by_id(self.board())
+        self.assertEqual(items["#7"]["state"], "waiting")
+        self.assertEqual(items["#7"]["title"], "Second, a new question.")
+        self.assertEqual(items["#8"]["state"], "waiting")
+
+    def test_ledger_ask_supersedes_a_derived_decision(self):
+        self._append(asst(200, {"type": "text", "text": "> **#7 — agree/disagree:** Derived."}))
+        sb.append_ledger(SID, {"kind": "ask", "id": "7", "text": "Ledger version", "topic": "x"})
+        items = [i for i in self.board()["items"] if i["id"] == "#7"]
+        self.assertEqual([i["title"] for i in items], ["Ledger version"])
+
+    def test_you_asked_list(self):
+        self._append(
+            prompt(500, "what is blocked?\nsecond line"),
+            asst(501, {"type": "text", "text": "\nTwo agents are running.\nDetails below."}),
+            prompt(510, 'look at this\n\n<pasted_content id="1">\nbig paste\n</pasted_content>'),
+            {"type": "attachment", "timestamp": iso(520), "uuid": "q-1",
+             "attachment": {"type": "queued_command", "prompt": "queued while busy", "origin": {"kind": "human"},
+                            "source_uuid": "src-1"}},
+            {"type": "queue-operation", "operation": "enqueue", "timestamp": iso(519), "content": "queued while busy"},
+            {"type": "attachment", "timestamp": iso(530),
+             "attachment": {"type": "queued_command", "prompt": notif("bxyz2", "completed", "x")}},
+            {"type": "attachment", "timestamp": iso(531),
+             "attachment": {"type": "queued_command", "prompt": "<system-reminder>x</system-reminder>"}},
+            {"type": "user", "timestamp": iso(540), "isMeta": True, "message": {"content": "meta text"}})
+        b = self.board()
+        asked = [i for i in b["items"] if i["state"] == "asked"]
+        titles = [i["title"] for i in asked]
+        self.assertEqual(titles[:3], ["queued while busy", "look at this", "what is blocked?"])  # newest first
+        self.assertEqual(titles.count("queued while busy"), 1)
+        self.assertNotIn("big paste", " ".join(titles))
+        self.assertEqual(b["counts"]["asked"], len(asked))
+        top = asked[2]
+        self.assertEqual(top["kind"], "question")
+        self.assertEqual(top["reply"], "Two agents are running.")
+        self.assertTrue(top["anchor"] is None or top["anchor"])
+        self.assertEqual(asked[0]["anchor"], "q-1")
+        self.assertEqual(asked[0]["anchor_alt"], "src-1")
+        # no notification text, no meta rows
+        self.assertFalse(any("task-notification" in i["title"] or i["title"] == "meta text" for i in asked))
+        d = sb.detail(b, top["id"])
+        self.assertIn("second line", " ".join(d["lines"]))
+        self.assertIn("Two agents are running.", " ".join(d["lines"]))
+        self.assertIn("YOU ASKED", sb.render_text(b))
+
+    def test_you_asked_is_capped(self):
+        self._append(*[prompt(600 + n, f"question {n}") for n in range(sb.ASKED_MAX + 8)])
+        asked = [i for i in self.board()["items"] if i["state"] == "asked"]
+        self.assertEqual(len(asked), sb.ASKED_MAX)
+        self.assertEqual(asked[0]["title"], f"question {sb.ASKED_MAX + 7}")
 
     def test_sprint_states(self):
         b = self.board()

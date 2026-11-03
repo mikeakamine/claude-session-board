@@ -4,8 +4,9 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Board, BoardItem, Detail } from '../types'
 
 // The pane beside the chat: what this session has RUNNING, WAITING ON YOU, BLOCKED,
-// HELD and DONE, grouped by topic. Every refresh runs scripts/session_board.py from this
-// plugin's own folder (local files only, zero model tokens); pressing a row fetches that item's detail (report path,
+// HELD and DONE, grouped by topic, plus YOU ASKED (your own prompts, newest first, collapsed).
+// Every refresh runs scripts/session_board.py from this plugin's own folder (local files only,
+// zero model tokens); pressing a row fetches that item's detail (report path,
 // bounded output tail, latest subagent text) and, for a live subagent, offers its
 // transcript in the main view.
 
@@ -16,14 +17,17 @@ const RUNNER =
   'p="$1"; shift; ' +
     '[ -f "$p" ] && exec python3 "$p" "$@"; echo "session_board.py not found at $p" >&2; exit 3'
 const deriver = ($: EngineInterface) => `${$.plugin.root}/scripts/session_board.py`
-// drawn in this order: what needs you first, so a short pane still shows it
-const VIEW_ORDER = ['waiting', 'blocked', 'held', 'running', 'done'] as const
+// drawn in this order: what needs you first, so a short pane still shows it.
+// 'asked' (your own prompts) sits after what needs you and before the running/done sections, but is
+// collapsed like done, so it costs two rows and never pushes an ask out
+const VIEW_ORDER = ['waiting', 'blocked', 'held', 'asked', 'running', 'done'] as const
 const LABEL: Record<string, string> = {
   running: 'RUNNING',
   waiting: 'WAITING ON YOU',
   blocked: 'BLOCKED',
   held: 'HELD',
   done: 'DONE',
+  asked: 'YOU ASKED',
 }
 const FG = '#E8E8E8'
 const FG_DIM = '#B8B8B8'
@@ -32,6 +36,7 @@ const COLOR: Record<string, string> = {
   waiting: 'warning',
   blocked: 'error',
   held: 'suggestion',
+  asked: FG_DIM,
 }
 
 const board = atom({ plugin: 'session-board', key: 'board' } as const, null, { shape: 'board-1' })
@@ -39,6 +44,9 @@ const open = atom({ plugin: 'session-board', key: 'open' } as const, null, { sha
 const detail = atom({ plugin: 'session-board', key: 'detail' } as const, null, { shape: 'detail-1' })
 const showDone = atom({ plugin: 'session-board', key: 'showDone' } as const, false, {
   shape: 'done-1',
+})
+const showAsked = atom({ plugin: 'session-board', key: 'showAsked' } as const, false, {
+  shape: 'asked-1',
 })
 
 const hm = (epoch?: number | null): string => {
@@ -128,6 +136,7 @@ async function refresh($: EngineInterface) {
         ended: i.ended ?? null,
         next_fire: i.next_fire ?? null,
         inferred: !!i.inferred,
+        verdict: i.verdict,
         agent_id: i.agent_id,
         anchor: i.anchor ?? null,
         anchor_alt: i.anchor_alt ?? null,
@@ -229,7 +238,7 @@ export const register: Register = on => {
   })
 
   // A one-line band above the prompt: the board's counts, and the show/hide toggle. Its Button
-  // claims the engine action TOGGLE_ACTION, so the person's chord for it (ctrl+x s in
+  // claims the engine action TOGGLE_ACTION, so the person's chord for it (ctrl+x s or opt+s in
   // ~/.claude/keybindings.json) presses it from the prompt while the band is mounted.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
@@ -240,7 +249,7 @@ export const register: Register = on => {
       <Button key="toggle-board" plain action={TOGGLE_ACTION} onPress={() => toggleBoard($)}>
         <Text color={FG_DIM}>
           board: {c.running ?? 0} running · {c.waiting ?? 0} waiting on you
-          {e.surface === 'terminal' ? ' · ctrl+x s show/hide' : ' · show/hide'}
+          {e.surface === 'terminal' ? ' · opt+s show/hide' : ' · show/hide'}
         </Text>
       </Button>
     )
@@ -261,6 +270,7 @@ export const register: Register = on => {
     const openId = await read($, open)
     const d = await read($, detail)
     const done = await read($, showDone)
+    const asked = await read($, showAsked)
 
     if (!b) return <Text dimColor>Reading this session…</Text>
     if (b.error) return <Text color="error">session board: {b.error}</Text>
@@ -326,23 +336,40 @@ export const register: Register = on => {
         hidden += rows.length
         continue
       }
-      if (state === 'done' && !done) {
+      if ((state === 'done' && !done) || (state === 'asked' && !asked)) {
+        const isAsked = state === 'asked'
         if (!add(
-          <Button key="show-done" plain onPress={() => update($, showDone, () => true)}>
-            <Text color={FG_DIM}>show done ({rows.length})</Text>
+          <Button
+            key={`show-${state}`}
+            plain
+            onPress={() => (isAsked ? update($, showAsked, () => true) : update($, showDone, () => true))}
+          >
+            <Text color={FG_DIM}>
+              {isAsked ? `show your questions (${rows.length})` : `show done (${rows.length})`}
+            </Text>
           </Button>,
         )) hidden += rows.length
         continue
       }
-      for (const it of rows) {
+      // an expanded YOU ASKED shows its newest few in an unfocused pane, so it never crowds out running/done
+      const shown = state === 'asked' && !focused ? rows.slice(0, 8) : rows
+      hidden += rows.length - shown.length
+      for (const it of shown) {
         const isOpen = openId === it.id && d && d.id === it.id
         // an opened row shows its whole title, wrapped; closed rows stay one line each
-        const head = `▾ ${it.topic.padEnd(10).slice(0, 10)} ${when(it, now).padStart(6)} ${it.title}`
+        // a decision shows its #N and, once answered, the verdict
+        const label = `${it.id.startsWith('#') && !it.title.startsWith(it.id) ? it.id + ' ' : ''}${it.title}${
+          it.id.startsWith('#') && it.verdict ? ` → ${it.verdict}` : ''
+        }`
+        const head = `▾ ${it.topic.padEnd(10).slice(0, 10)} ${when(it, now).padStart(6)} ${label}`
         add(
           <Button key={it.id} plain onPress={() => pressRow($, it)}>
-            <Text color={state === 'done' ? FG_DIM : FG} wrap={isOpen ? 'wrap' : 'truncate-end'}>
+            <Text
+              color={state === 'done' || state === 'asked' ? FG_DIM : FG}
+              wrap={isOpen ? 'wrap' : 'truncate-end'}
+            >
               {openId === it.id ? '▾' : '▸'} {it.topic.padEnd(10).slice(0, 10)}{' '}
-              {when(it, now).padStart(6)} {it.title}
+              {when(it, now).padStart(6)} {label}
               {it.inferred ? ' (inferred)' : ''}
             </Text>
           </Button>,
@@ -405,10 +432,15 @@ export const register: Register = on => {
           )
         }
       }
-      if (state === 'done' && done) {
+      if ((state === 'done' && done) || (state === 'asked' && asked)) {
+        const isAsked = state === 'asked'
         add(
-          <Button key="hide-done" plain onPress={() => update($, showDone, () => false)}>
-            <Text color={FG_DIM}>hide done</Text>
+          <Button
+            key={`hide-${state}`}
+            plain
+            onPress={() => (isAsked ? update($, showAsked, () => false) : update($, showDone, () => false))}
+          >
+            <Text color={FG_DIM}>{isAsked ? 'hide your questions' : 'hide done'}</Text>
           </Button>,
         )
       }

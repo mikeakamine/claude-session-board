@@ -57,14 +57,28 @@ Requires `python3` on your `PATH` (3.7 or later, standard library only).
   when focused. Unfocused, a short pane shows what needs you first and ends with
   "+N more".
 - Press a row for its detail; press it again to close it.
+- **Decisions you are asked.** When the assistant writes a line like
+  `> **#12 — agree/disagree:** Publish the repo.` (blockquote and bold are optional;
+  `#12 - agree/disagree:` and `#12 agree/disagree:` work too), it shows under WAITING ON
+  YOU as `#12`, and a press scrolls the transcript to that message. A later definition of
+  the same number replaces the earlier one. Answer in the prompt box with `12 agree`,
+  `1 agree, 2 disagree`, `#12 ...`, `re #12 (...): ...`, or the words of the ask plus
+  `agree` ("release notes agree"); the row moves to DONE with your verdict. Plain numbered
+  option lists are no longer read as asks unless the reply also says agree/disagree.
+- **YOU ASKED (N).** Your own prompts (not notifications), newest first, last 50, collapsed
+  behind "show your questions (N)". Press one to jump back to it in the transcript and see
+  the first line of the reply it got.
 - **Show/hide from the prompt (optional).** The band's toggle claims the engine action
   `app:toggleDiffNoiseFilter`, which is unbound by default. Bind a chord to it in
-  `~/.claude/keybindings.json` and that chord shows or hides the pane from the prompt:
+  `~/.claude/keybindings.json` and that chord shows or hides the pane from the prompt.
+  Two chords work side by side, `ctrl+x s` and `meta+s` (Option+S on a Mac; the band's
+  hint reads "opt+s show/hide"):
 
   ```json
   {
     "bindings": [
-      { "context": "Global", "bindings": { "ctrl+x s": "app:toggleDiffNoiseFilter" } }
+      { "context": "Global", "bindings": { "ctrl+x s": "app:toggleDiffNoiseFilter",
+                                            "meta+s": "app:toggleDiffNoiseFilter" } }
     ]
   }
   ```
@@ -122,6 +136,7 @@ All optional, read from the environment (set them in the `env` block of
 | `SESSION_BOARD_NAMES_DIR` | unset | a folder of `<session id>.json` files holding `{"session_id": ..., "session_name": ...}`; with it, the board shows names and `--session` accepts a name. Without it, the short session id is shown |
 | `SESSION_BOARD_SPRINTS_DIR` | unset | turns on the sprint feature (below) |
 | `SESSION_BOARD_ASK_LABEL` | `Ask\|User` | regex for the label that starts an ask in a sprint log line |
+| `SESSION_BOARD_PENDING` | unset (off) | a JSON file, or a shell command printing JSON, of items that wait for you outside any session (for example an inbox of handoffs from another tool): `[{"id", "kind", "producer", "flags": [], "conflict": false, "received_at": ISO-8601, "review": "command"}]`. They show in every session as WAITING (BLOCKED when flagged or in conflict), titled "<kind> from <producer> waiting for review"; keep content out of it, names and kinds only. A failing source shows nothing |
 | `SESSION_BOARD_TASKS_GLOB` | `/private/tmp/claude-*/*/{sid}/tasks` on macOS, `/tmp/claude-*/*/{sid}/tasks` elsewhere | where background command output files live |
 
 ### Sprints (optional)

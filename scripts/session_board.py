@@ -14,9 +14,14 @@ Zero model tokens. Derived from local files only, re-read on every call:
       - <task-notification> events (task-id, status, summary, result)
       - CronCreate / CronDelete (one-shot crons whose fire time passed count as done)
       - AskUserQuestion calls with no answer yet
-      - numbered asks in the assistant's own replies ("1. **Venue, Friday:** ...") under a
-        message that says it needs you -- labelled "inferred"; a later prompt of yours
-        that names the number marks it answered
+      - decisions in the assistant's replies: "#N agree/disagree: text" lines (blockquoted or
+        not, bold or not) are asks #N, anchored on that message; a later definition of the same
+        #N replaces the earlier. A numbered "1. **Title:** body" list is inferred as asks only
+        in a reply with no explicit #N line that also says agree/disagree (labelled "inferred").
+        A later prompt of yours ("7 agree", "#7 ...", "re #7 (..): agree", "1 agree, 2 agree",
+        "<words from the ask> agree") resolves it and stores the verdict.
+      - your own prompts (not notifications): the collapsed YOU ASKED list (state "asked",
+        newest 50), each anchored on its own record, with the assistant's first reply line
   * optional: sprint folders the transcript references (<sprints dir>/<id>/): manifest.json,
     launched.json and the SPRINT.md running log ("HH:MM key -- STATE: ... Ask: ..."); off
     unless $SESSION_BOARD_SPRINTS_DIR names the folder that holds them
@@ -36,6 +41,9 @@ Configuration (environment variables, all optional):
     SESSION_BOARD_TASKS_GLOB   background task output folders, "{sid}" for the session id
     SESSION_BOARD_ASK_LABEL    regex for the label that starts an ask in a sprint log line
                                (default "Ask|User")
+    SESSION_BOARD_PENDING      a JSON file, or a shell command printing JSON, listing items that wait
+                               for you outside any session (shown in every session as WAITING, or
+                               BLOCKED when flagged); see pending_items()   (default: unset, off)
 
 CLI
     session_board.py show   [--session S] [--json]           # S = uuid, uuid prefix or name
@@ -51,6 +59,7 @@ import glob
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -70,9 +79,12 @@ TASK_GLOB = os.environ.get("SESSION_BOARD_TASKS_GLOB") or (
     "/private/tmp/claude-*/*/{sid}/tasks" if sys.platform == "darwin" else "/tmp/claude-*/*/{sid}/tasks")
 ASK_LABEL = os.environ.get("SESSION_BOARD_ASK_LABEL") or "Ask|User"
 
-STATES = ("running", "waiting", "blocked", "held", "done")
+STATES = ("running", "waiting", "blocked", "held", "done", "asked")
 STATE_LABEL = {"running": "RUNNING", "waiting": "WAITING ON YOU", "blocked": "BLOCKED",
-               "held": "HELD", "done": "DONE"}
+               "held": "HELD", "done": "DONE", "asked": "YOU ASKED"}
+ASKED_MAX = 50          # your most recent prompts kept on the board (state "asked")
+ASKED_TITLE = 100
+ASKED_TEXT = 1200
 LEDGER_KINDS = ("ask", "todo", "done", "held", "blocked", "running", "topic")
 KIND_STATE = {"ask": "waiting", "todo": "waiting", "done": "done", "held": "held",
               "blocked": "blocked", "running": "running"}
@@ -85,6 +97,24 @@ NEEDS_YOU_RE = re.compile(r"need(s)? you|your call|decision|agree|waiting on you
                           r"blocking on you|only you|yours to", re.I)
 ASK_LINE_RE = re.compile(r"^\s*(?:[-*]\s*)?(?:\*\*)?#?(\d{1,2})[.)]?\s*(?:\*\*)?\s*"
                          r"\*\*([^*]{2,80}?)[:.]?\*\*[:.]?\s*(.*)$")
+# An explicit decision the assistant wrote for you, in any of the shapes it has used:
+#   > **#12 — agree/disagree:** text     **#12 - agree/disagree**: text     #12 agree/disagree: text
+DECISION_RE = re.compile(
+    r"^\s*(?:>\s*)*(?:[-*]\s+)?(?:\*\*|__)?\s*#(\d{1,3})\s*(?:\*\*|__)?\s*(?:[—–-]+|:)?\s*(?:\*\*|__)?\s*"
+    r"agree\s*(?:/|or|-|,)\s*disagree\s*(?:\*\*|__)?\s*[:：]\s*(?:\*\*|__)?\s*(.*)$",
+    re.I)
+# plain numbered lists are only read as asks when the reply itself speaks of agreeing
+AGREE_MARK_RE = re.compile(r"\b(?:dis)?agree", re.I)
+DEFAULT_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=(?:If you|Default|Otherwise|Once |Nothing is sent)\b)")
+VERDICT_WORD = r"(?:dis)?agree(?:d)?|ok(?:ay)?|yes|no|approved?"
+SEG_NUM_RE = re.compile(r"^\s*#?(\d{1,3})\s*[:.\-–—)]?\s*(" + VERDICT_WORD + r")\b", re.I)
+SEG_VERB_RE = re.compile(r"^\s*(" + VERDICT_WORD + r")\s+(?:on\s+)?#(\d{1,3})\b", re.I)
+SEG_NAME_RE = re.compile(r"^\s*([a-z][\w' -]{3,40}?)\s+((?:dis)?agree)\b", re.I)
+NAME_STOP = {"also", "just", "all", "both", "then", "yes", "and", "the", "that", "this", "ok", "okay",
+             "sure", "fine", "good", "now", "too", "but", "not", "you", "your", "for", "with"}
+RE_DECISION_RE = re.compile(r"^\s*re\s+#(\d{1,3})\b(.*)$", re.I | re.S)
+BARE_DECISION_RE = re.compile(r"^\s*#(\d{1,3})\b[\s:,.\-–—]*(" + VERDICT_WORD + r")?", re.I)
+PASTE_RE = re.compile(r"<pasted_content[^>]*>.*?</pasted_content>|<system-reminder>.*?</system-reminder>", re.S)
 LOG_LINE_RE = re.compile(r"^-\s+(\d{1,2}:\d{2})\s+(.*)$")
 KEY_RE = r"[a-z][\w-]*:[\w.-]+"
 
@@ -231,7 +261,7 @@ def _is_user_prompt(rec):
             return False
         c = " ".join(t for k, t in _texts(c))
     c = c or ""
-    if "<task-notification>" in c or c.lstrip().startswith("<"):
+    if "<task-notification>" in c or PASTE_RE.sub("", c).lstrip().startswith("<"):
         return False
     return bool(c.strip())
 
@@ -245,6 +275,8 @@ def parse_transcript(path, now=None, sprint_re=None):
     uses = {}               # tool_use_id -> (name, input, epoch)
     sprints = []
     prompts = []            # (epoch, text) of the user's prompts
+    asked = []              # one dict per prompt of the user's: the "YOU ASKED" list
+    pending = []            # asked entries still waiting for the assistant's first reply line
     inferred = {}           # number -> item (latest list wins)
     marks = []              # (epoch, tool_use_id): where in the transcript each tool call sits
     mentions = {}           # "23" -> uuid of the latest assistant message that names #23
@@ -275,6 +307,14 @@ def parse_transcript(path, now=None, sprint_re=None):
             if queued and "<task-notification>" not in queued:
                 # the user typing while a turn runs arrives as a queued command, not a user record
                 _on_reply(queued, ts, rec.get("uuid"), refs, replies)
+                att = rec.get("attachment")
+                origin = att.get("origin") if isinstance(att, dict) else None
+                human = not isinstance(origin, dict) or origin.get("kind") in (None, "human")
+                if typ == "attachment" and human and \
+                        not PASTE_RE.sub("", queued).lstrip().startswith("<"):
+                    # the queue-operation row repeats this text: only the delivered attachment counts
+                    prompts.append((ts, queued))
+                    _on_prompt(asked, pending, queued, ts, rec.get("uuid"), att.get("source_uuid"))
             if typ not in ("user", "assistant"):
                 continue
             msg = rec.get("message") or {}
@@ -292,7 +332,12 @@ def parse_transcript(path, now=None, sprint_re=None):
                             if m.group(1) not in sprints:
                                 sprints.append(m.group(1))
                     elif b.get("type") == "text":
-                        _scan_asks(b.get("text") or "", ts, inferred, rec.get("uuid"))
+                        _scan_asks(b.get("text") or "", ts, inferred, rec.get("uuid"), msg.get("id"))
+                        if pending and (b.get("text") or "").strip():
+                            line = next(l for l in b["text"].splitlines() if l.strip())
+                            for a in pending:
+                                a["reply"] = _clip(line.strip(" >*#-"), 200)
+                            pending.clear()
                         if rec.get("uuid"):
                             for n in set(NUM_MENTION_RE.findall(b.get("text") or "")):
                                 mentions[n] = (rec["uuid"], msg.get("id"))
@@ -310,6 +355,10 @@ def parse_transcript(path, now=None, sprint_re=None):
                 if _is_user_prompt(rec):
                     t = content if isinstance(content, str) else " ".join(x for _, x in _texts(content))
                     prompts.append((ts, t))
+                    if rec.get("isCompactSummary"):
+                        pending.clear()
+                    else:
+                        _on_prompt(asked, pending, t, ts, rec.get("uuid"), None)
                     _on_reply(t, ts, rec.get("uuid"), refs, replies)
     # one-shot crons whose fire time passed: assume fired
     for c in crons.values():
@@ -318,8 +367,11 @@ def parse_transcript(path, now=None, sprint_re=None):
             c["state"] = "done"
             c["note"] = "fire time passed (assumed fired)"
             c["ended"] = c["next_fire"]
+    _answer_decisions(inferred, prompts)
     # inferred asks answered by a later prompt naming the number
     for n, it in inferred.items():
+        if it.get("decision"):
+            continue
         pat = re.compile(r"(?:^|[\s,;(])(?:#|\d+\.)?" + re.escape(n) + r"(?=[\s.:),]|$)")
         for pts, text in prompts:
             if pts and it["started"] and pts > it["started"] and pat.search(text[:400]):
@@ -328,7 +380,8 @@ def parse_transcript(path, now=None, sprint_re=None):
                 it["ended"] = pts
                 break
     items = list(agents.values()) + list(bashes.values()) + list(crons.values()) + \
-        [a for a in asks_q.values() if a["state"] == "waiting"] + list(inferred.values())
+        [a for a in asks_q.values() if a["state"] == "waiting"] + list(inferred.values()) + \
+        _asked_items(asked)
     return items, sprints, prompts, {"tools": marks, "mentions": mentions, "refs": refs, "replies": replies}
 
 
@@ -463,20 +516,170 @@ def _on_notification(body, ts, agents, bashes):
         target["output"] = tags["output-file"]
 
 
-def _scan_asks(text, ts, inferred, msg_uuid=None):
-    """Numbered "N. **Title:** body" lines in a reply that says it needs the user."""
-    if not NEEDS_YOU_RE.search(text):
+def _decision_title(text):
+    """Short title of a decision: markdown stripped, the 'if you disagree / default' sentence cut."""
+    text = re.sub(r"[`*_]{1,3}", "", text or "")
+    text = " ".join(text.split())
+    return DEFAULT_SENTENCE_RE.split(text, 1)[0].strip()
+
+
+def _scan_asks(text, ts, inferred, msg_uuid=None, msg_id=None):
+    """Asks in an assistant reply. Explicit "#N agree/disagree: text" lines (blockquoted or not,
+    bold or not) are decisions; a later definition of the same #N replaces the earlier one. Only
+    when a reply has none, "N. **Title:** body" lines count, and only if it speaks of agreeing."""
+    explicit = {}
+    for line in text.splitlines():
+        m = DECISION_RE.match(line)
+        if m and m.group(2).strip():
+            n, body = m.group(1), m.group(2).strip()
+            explicit[n] = {"id": "#" + n, "kind": "ask", "state": "waiting", "decision": True,
+                           "title": _clip(_decision_title(body)),
+                           "ask": _clip(re.sub(r"[`*]{1,3}", "", body), SUMMARY_MAX),
+                           "started": ts, "source": "assistant reply (decision)", "anchor": msg_uuid,
+                           "anchor_alt": msg_id}
+    if explicit:
+        inferred.update(explicit)
+        return
+    if not (NEEDS_YOU_RE.search(text) and AGREE_MARK_RE.search(text)):
         return
     found = {}
     for line in text.splitlines():
         m = ASK_LINE_RE.match(line)
         if m:
             n, title, body = m.group(1), m.group(2).strip(), m.group(3).strip()
+            if inferred.get(n, {}).get("decision"):
+                continue          # an explicit decision of the same number is not overwritten
             found[n] = {"id": "#" + n, "kind": "ask", "state": "waiting", "inferred": True,
                         "title": _clip(f"{title}: {body}"), "started": ts,
-                        "source": "parent reply (inferred)", "anchor": msg_uuid}
+                        "source": "assistant reply (inferred)", "anchor": msg_uuid}
     if len(found) >= 1:
         inferred.update(found)
+
+
+def _verdict(word):
+    w = (word or "").lower()
+    return "disagree" if w in ("disagree", "disagreed", "no") else "agree" if w else None
+
+
+def _prompt_verdicts(text, open_decisions):
+    """{number: verdict-or-None} that one prompt of yours answers. Forms: "7 agree", "#7 ...",
+    "agree on #7", "re #7 (title): agree", comma/newline lists, and "<words from a decision> agree"."""
+    out = {}
+    m = RE_DECISION_RE.match(text)
+    if m:
+        rest = m.group(2)
+        rest = rest.split("):", 1)[1] if "):" in rest else rest.lstrip(" :")
+        w = re.match(r"\s*(" + VERDICT_WORD + r")\b", rest, re.I)
+        if w:
+            out[m.group(1)] = _verdict(w.group(1))
+        elif rest.strip():
+            out[m.group(1)] = None          # any typed reply to the decision answers it
+        return out
+    m = BARE_DECISION_RE.match(text)
+    if m:
+        out[m.group(1)] = _verdict(m.group(2))
+    for seg in re.split(r"[,;\n]", text[:600]):
+        m = SEG_NUM_RE.match(seg)
+        if m:
+            out[m.group(1)] = _verdict(m.group(2))
+            continue
+        m = SEG_VERB_RE.match(seg)
+        if m:
+            out[m.group(2)] = _verdict(m.group(1))
+            continue
+        m = SEG_NAME_RE.match(seg)
+        if m:
+            words = m.group(1).lower().split()
+            # two real words, or one long one: "I also agree" must not name a decision
+            if len(words) < 2 and len(words[0]) < 7 or any(len(w) < 3 or w in NAME_STOP for w in words):
+                continue
+            hits = [n for n, it in open_decisions.items()
+                    if all(re.search(r"\b" + re.escape(w) + r"\b",
+                                     (it["title"] + " " + (it.get("ask") or "")).lower())
+                           for w in words)]
+            if len(hits) == 1:
+                out[hits[0]] = _verdict(m.group(2))
+    return out
+
+
+def _answer_decisions(inferred, prompts):
+    """A later prompt of yours that names a decision's number resolves it (verdict stored)."""
+    dec = {n: it for n, it in inferred.items() if it.get("decision")}
+    for pts, text in prompts:
+        open_ = {n: it for n, it in dec.items()
+                 if it["state"] == "waiting" and pts and it["started"] and pts > it["started"]}
+        if not open_:
+            continue
+        for n, verdict in _prompt_verdicts(text or "", open_).items():
+            it = open_.get(n)
+            if it:
+                it.update(state="done", ended=pts, verdict=verdict or "answered",
+                          note=f"answered {_local_hm(pts)}" + (f": {verdict}" if verdict else ""))
+
+
+def _prompt_clean(text):
+    text = PASTE_RE.sub(" [pasted] ", text or "")
+    return "\n".join(l.rstrip() for l in text.strip().splitlines())
+
+
+def _on_prompt(asked, pending, text, ts, uuid, alt):
+    """One of your own prompts, for the YOU ASKED list (notifications never get here)."""
+    clean = _prompt_clean(text)
+    lines = [l for l in clean.splitlines() if l.strip() and l.strip() != "[pasted]"]
+    if not lines or clean.startswith(("[Request interrupted", "This session is being continued")):
+        return
+    first = lines[0]
+    entry = {"ts": ts, "uuid": uuid, "alt": alt, "title": _clip(first, ASKED_TITLE),
+             "text": clean[:ASKED_TEXT], "reply": None}
+    asked.append(entry)
+    pending.clear()
+    pending.append(entry)
+
+
+def _asked_items(asked):
+    out = []
+    for n, a in enumerate(asked[-ASKED_MAX:]):
+        key = (a["uuid"] or "")[:8] or f"{int(a['ts'] or 0)}.{n}"
+        out.append({"id": "p:" + key, "kind": "question", "state": "asked", "topic": "asked",
+                    "title": a["title"], "started": a["ts"], "prompt_text": a["text"],
+                    "reply": a["reply"], "source": "your prompt", "anchor": a["uuid"],
+                    "anchor_alt": a["alt"]})
+    return out
+
+
+# ---------------------------------------------------------------- pending items (optional)
+def pending_items():
+    """Items from outside the transcript that wait for you in every session (for example an inbox of
+    handoffs from another tool). OFF unless $SESSION_BOARD_PENDING is set to either a JSON file or a
+    shell command that prints JSON: a list of {"id", "kind", "producer", "flags": [..],
+    "conflict": bool, "received_at": ISO-8601, "review": "command to review it"}. Names and kinds
+    only -- never put the content itself in it. Flagged or conflicting items show as blocked.
+    A failing source shows nothing."""
+    src = os.environ.get("SESSION_BOARD_PENDING")
+    if not src:
+        return []
+    try:
+        if os.path.isfile(os.path.expanduser(src)):
+            with open(os.path.expanduser(src)) as f:
+                rows = json.load(f)
+        else:
+            rows = json.loads(subprocess.run(src, shell=True, capture_output=True, text=True,
+                                             timeout=10).stdout or "[]")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    out = []
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict) or not r.get("id"):
+            continue
+        flags = [str(x) for x in (r.get("flags") or [])]
+        h8 = str(r["id"])[:8]
+        out.append({"id": "b:" + h8, "kind": "pending", "state": "blocked" if flags or r.get("conflict") else "waiting",
+                    "topic": "pending", "title": _clip(f"{r.get('kind') or 'item'} from "
+                                                       f"{r.get('producer') or 'unknown'} waiting for review"),
+                    "started": _iso_to_epoch(r.get("received_at")), "source": "$SESSION_BOARD_PENDING",
+                    "pending_id": h8, "review": str(r.get("review") or "")[:200], "flags": flags,
+                    "conflict": bool(r.get("conflict"))})
+    return out
 
 
 # ---------------------------------------------------------------- sprint
@@ -622,8 +825,14 @@ def apply_ledger(items, rows):
     # explicit ledger rows supersede an inferred ask with the same number
     by_id = {it["id"]: it for it in items}
     for key, e in explicit.items():
-        if e["id"] in by_id and by_id[e["id"]].get("inferred"):
-            items.remove(by_id[e["id"]])
+        old = by_id.get(e["id"])
+        if old and (old.get("inferred") or old.get("decision")):
+            items.remove(old)
+            if old.get("decision") and old["state"] == "done" and e["state"] == "waiting" \
+                    and (old.get("ended") or 0) > (e.get("asked") or 0):
+                # the user answered the transcript's own copy after the ledger note was written
+                e.update(state="done", ended=old["ended"], verdict=old.get("verdict"),
+                         note=old.get("note"))
         items.append(e)
     for it in items:
         bare = it["id"].lstrip("#").split(":", 1)[-1]
@@ -684,6 +893,7 @@ def build_board(session=None, now=None, sprints_dir=None):
             s["ended"] = a.get("ended")
         items.remove(a)
     items = apply_ledger(items, read_ledger(sid))
+    items.extend(pending_items())
     for it in items:
         # where a press on the side pane scrolls the transcript: a numbered ask goes to the latest
         # reply that names its #N (where it was last discussed); else the item's own tool call or
@@ -704,10 +914,10 @@ def build_board(session=None, now=None, sprints_dir=None):
             prev = it.get("anchor") or anchor_for(anchors["tools"], it.get("started"))
             it["anchor"], alt = anchors["refs"][it["id"]]
             it["anchor_alt"] = alt or prev
-        elif num and num in anchors["mentions"]:
+        elif num and num in anchors["mentions"] and not it.get("decision"):
             # a message row's render id is its record uuid or its API message id: the pane tries both
             it["anchor"], it["anchor_alt"] = anchors["mentions"][num]
-        elif not it.get("anchor"):
+        elif not it.get("anchor") and it.get("kind") != "pending":
             it["anchor"] = anchor_for(anchors["tools"], it.get("started"))
         if it.get("state") == "running" and it.get("output"):
             try:
@@ -798,6 +1008,15 @@ def detail(board, item_id, lines=30):
     for k in ("ask", "evidence", "summary", "result"):
         if it.get(k):
             L.append(f"{k}: {it[k]}")
+    if it.get("kind") == "pending":
+        if it.get("review"):
+            L.append("review: " + it["review"])
+        L.append("flags: " + (", ".join(it["flags"]) or "none") + " · conflict: " + ("yes" if it["conflict"] else "no"))
+    if it.get("state") == "asked":
+        L.append("you asked:")
+        L.extend("  " + _clip(x, 300) for x in (it.get("prompt_text") or it["title"]).splitlines()[:14])
+        if it.get("reply"):
+            L.append("Claude's reply began: " + it["reply"])
     for k in ("report", "brief", "output"):
         if it.get(k):
             out["paths"][k] = it[k]
@@ -829,7 +1048,7 @@ def render_text(board, width=100):
     c = board["counts"]
     out = [f"{board['session']} · {_local_hm(now)} · {c['running']} running · "
            f"{c['waiting']} waiting on you · {c['blocked'] + c['held']} blocked/held · "
-           f"{c['done']} done"]
+           f"{c['done']} done · {c.get('asked', 0)} you asked"]
     for s in board["sprints"]:
         out.append(f"sprint {s['id']} ({s.get('status')}, {s.get('window') or ''}) "
                    f"launched {s['launched']}/{s['queued']}")
@@ -839,7 +1058,7 @@ def render_text(board, width=100):
             continue
         out.append("")
         out.append(f"{STATE_LABEL[state]} ({len(rows)})")
-        shown = rows if state != "done" else rows[:12]
+        shown = rows if state not in ("done", "asked") else rows[:12]
         for it in shown:
             when = ""
             if state == "running":
@@ -853,7 +1072,7 @@ def render_text(board, width=100):
             line = f"  {it['id']:<14} {it['topic'][:10]:<10} {when:>8}  {it['title']}{tag}{extra}"
             out.append(_clip(line, width))
         if len(rows) > len(shown):
-            out.append(f"  … {len(rows) - len(shown)} more done (--json for all)")
+            out.append(f"  … {len(rows) - len(shown)} more {state} (--json for all)")
     out.append("")
     out.append("detail: session_board.py detail <id>   ledger: " + board["ledger"])
     return "\n".join(out)

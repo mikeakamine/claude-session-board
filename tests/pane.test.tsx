@@ -155,3 +155,109 @@ test('an opened row wraps its detail lines even when the pane is not focused', a
   expect((t as any).props.wrap).toBe('wrap')
   await ui.unmount()
 })
+
+const ASKED = [
+  { id: 'p:aaaa1111', kind: 'question', state: 'asked', topic: 'asked', title: 'what is blocked?',
+    started: 1793479900 },
+  { id: 'p:bbbb2222', kind: 'question', state: 'asked', topic: 'asked', title: 'is the reply button working?',
+    started: 1793479800 },
+]
+
+test('YOU ASKED is collapsed behind a button, between the asks and the running section', async ($, on) => {
+  const boardJson = { ...BOARD, counts: { ...BOARD.counts, asked: 2 },
+    items: [...BOARD.items, ...ASKED, { id: '#9', kind: 'ask', state: 'done', topic: 'x',
+      title: 'Use option 1', verdict: 'agree' }] }
+  on('command.register', () => ({ value: { command: 'board' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 'sid-1' }))
+  on('clock.every', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.scroll', () => ({ value: {} }))
+  on('process.run', (_, e) => ({ value: { exitCode: 0, stderr: '',
+    stdout: e.argv.includes('detail') ? JSON.stringify({ lines: ['p:aaaa1111  [asked]  what is blocked?', 'you asked:', "Claude's reply began: two agents"] }) : JSON.stringify(boardJson),
+    isStdoutTruncated: false, isStderrTruncated: false } }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /YOU ASKED \(2\)/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Button', text: /show your questions \(2\)/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Button', text: /what is blocked/ })).toBeFalsy()
+  expect(await ui.find({ type: 'Button', text: /Use option 1/ })).toBeFalsy()   // done is collapsed too
+  await $.ui.press({ plugin: 'session-board', key: 'show-asked' })
+  expect(await ui.find({ type: 'Button', text: /what is blocked/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Button', text: /hide your questions/ })).toBeTruthy()
+  // a press opens the prompt's detail (the harness has no ui.scroll, so the rows here carry no anchor)
+  await $.ui.press({ plugin: 'session-board', key: 'p:aaaa1111' })
+  expect(await ui.find({ type: 'Text', text: /Claude's reply began/ })).toBeTruthy()
+  await ui.unmount()
+})
+
+test('an answered decision shows its #N and verdict', async ($, on) => {
+  const boardJson = { ...BOARD, items: [{ id: '#12', kind: 'ask', state: 'done', topic: 'x',
+    title: 'Publish the repo', verdict: 'agree', ended: 1793479500 }] }
+  on('command.register', () => ({ value: { command: 'board' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 'sid-1' }))
+  on('clock.every', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.scroll', () => ({ value: {} }))
+  on('process.run', (_, e) => ({ value: { exitCode: 0, stderr: '',
+    stdout: e.argv.includes('detail') ? JSON.stringify({ lines: ['x'] }) : JSON.stringify(boardJson),
+    isStdoutTruncated: false, isStderrTruncated: false } }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await $.ui.press({ plugin: 'session-board', key: 'show-done' })
+  expect(await ui.find({ type: 'Button', text: /#12 Publish the repo → agree/ })).toBeTruthy()
+  await ui.unmount()
+})
+
+test('YOU ASKED never displaces a waiting item in a short pane', async ($, on) => {
+  const boardJson = { ...BOARD, counts: { running: 1, waiting: 2, blocked: 0, held: 0, done: 1, asked: 2 },
+    items: [
+      { id: '#5', kind: 'ask', state: 'waiting', topic: 'cert', title: 'Cert renewal needs your sign-off' },
+      { id: '#6', kind: 'ask', state: 'waiting', topic: 'rollout', title: 'Beta rollout date' },
+      ...ASKED, BOARD.items[0], BOARD.items[2]] }
+  on('command.register', () => ({ value: { command: 'board' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 'sid-1' }))
+  on('clock.every', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.scroll', () => ({ value: {} }))
+  on('process.run', (_, e) => ({ value: { exitCode: 0, stderr: '',
+    stdout: e.argv.includes('detail') ? JSON.stringify({ lines: ['x'] }) : JSON.stringify(boardJson),
+    isStdoutTruncated: false, isStderrTruncated: false } }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({
+    ...PANE, surface: 'terminal',
+    props: { ...PANE.props, placement: 'inline', scroll: { offset: 0, bodyRows: 6 } },
+  })
+  expect(await ui.find({ type: 'Button', text: /Cert renewal/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Button', text: /Beta rollout/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Button', text: /what is blocked/ })).toBeFalsy()
+  expect(await ui.find({ type: 'Text', text: /\+\d+ more/ })).toBeTruthy()
+  await ui.unmount()
+})
+
+test('an expanded YOU ASKED shows its newest rows only in an unfocused pane', async ($, on) => {
+  const boardJson = { ...BOARD, counts: { ...BOARD.counts, asked: 12 },
+    items: [BOARD.items[0], ...Array.from({ length: 12 }, (_, n) => ({ id: `p:q${n}`, kind: 'question',
+      state: 'asked', topic: 'asked', title: `question number ${n}`, started: 1793479000 - n }))] }
+  on('command.register', () => ({ value: { command: 'board' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 'sid-1' }))
+  on('clock.every', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('process.run', () => ({ value: { exitCode: 0, stdout: JSON.stringify(boardJson), stderr: '',
+    isStdoutTruncated: false, isStderrTruncated: false } }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await $.ui.press({ plugin: 'session-board', key: 'show-asked' })
+  expect(await ui.find({ type: 'Button', text: /question number 7/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Button', text: /question number 8/ })).toBeFalsy()
+  expect(await ui.find({ type: 'Text', text: /\+4 more/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Button', text: /Offsite agenda prep/ })).toBeTruthy()
+  await ui.unmount()
+})
